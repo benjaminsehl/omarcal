@@ -52,8 +52,8 @@ git clone https://github.com/benjaminsehl/omarcal.git ~/Work/omarcal
 cd ~/Work/omarcal && ./install.sh
 ```
 
-This links the folder into `~/.config/omarchy/plugins/sehl.omarcal` and
-enables it. The manifest declares `clonedFrom: omarchy.clock`, so it takes the
+This links the folder into `~/.config/omarchy/plugins/sehl.omarcal`, enables
+it, and installs the hotkeys. The manifest declares `clonedFrom: omarchy.clock`, so it takes the
 clock's slot in the bar and keeps the clock's settings (your `format`). The
 Calendar hotkey (`SUPER+CTRL+ALT+D`, `omarchy-shell shell toggle
 omarchy.clock`) opens this panel instead. It also points `bar.centerAnchor` at
@@ -97,6 +97,23 @@ Files:
 | `~/.cache/omarcal/events.json` | last good fetch, shown when offline |
 
 ## Use
+
+### Hotkeys
+
+| Mac keyboard | Windows keyboard | |
+|---|---|---|
+| `⌘⌥J` | `Win+Alt+J` | join the current or next meeting with a call link |
+| `⌘⌥⇧J` | `Win+Alt+Shift+J` | new Google Meet: on your calendar now, link copied, call opened |
+| `⌃⌥⌘D` | `Ctrl+Alt+Win+D` | open the panel (Omarchy's Calendar hotkey) |
+
+The join hotkey skips meetings without a link: with "Gym" at 6:30 and a
+standup on Meet at 9:00, it joins the standup. When there's nothing to join,
+a notification says so. The bindings live in `hypr/omarcal.lua`;
+`install.sh` loads them through `~/.local/state/omarchy/toggles/hypr/`, and
+`uninstall.sh` removes them. To change the keys, edit that file and run
+`hyprctl reload`.
+
+### Panel
 
 | | |
 |---|---|
@@ -181,6 +198,7 @@ python3 -m unittest discover -s tests       # bin/omarcal (link detection, parsi
 omarchy-shell sehl.omarcal demo default     # canned data: default | now | empty | setup | signedOut
 omarchy-shell sehl.omarcal demo off
 omarchy-shell sehl.omarcal status           # JSON: phase, next meeting, bar text
+omarchy-shell sehl.omarcal joinNext | newMeetingNow   # what the hotkeys call
 omarchy-shell sehl.omarcal join | newMeeting | refresh | open | toggle
 ```
 

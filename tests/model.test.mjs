@@ -158,3 +158,13 @@ test("demo data is well formed", () => {
   }
   assert.equal(M.focusEvent(M.demoEvents(NOW, "now"), NOW).id, "d1")
 })
+
+test("join hotkey skips plain blocks for the next call", () => {
+  const gym = ev("gym", 10, 60)
+  const call = ev("call", 120, 30, { url: "https://meet.google.com/a-b-c" })
+  assert.equal(M.focusEvent([gym, call], NOW).id, "gym")
+  assert.equal(M.joinable([gym, call], NOW).id, "call")
+  const now = ev("now", -5, 30, { url: "https://zoom.us/j/1" })
+  assert.equal(M.joinable([now, call], NOW).id, "now")
+  assert.equal(M.joinable([gym], NOW), null)
+})

@@ -192,7 +192,9 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): string { cal.refresh(); return "ok" }
     function join(): string { return cal.joinFocus() ? "ok" : "no meeting to join" }
+    function joinNext(): string { return cal.joinNext() }
     function newMeeting(): string { cal.newMeeting(); return "ok" }
+    function newMeetingNow(): string { cal.newMeetingNow(); return "ok" }
     function openCalendar(): string { cal.openCalendar(); return "ok" }
     function signIn(): string { cal.signIn(); return "ok" }
     function demo(scenario: string): string { return cal.setDemo(scenario) }

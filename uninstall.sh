@@ -19,5 +19,12 @@ if [[ -f $shell_json ]] && command -v jq >/dev/null; then
   fi
 fi
 
+toggle="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/omarcal.lua"
+if [[ -f $toggle ]]; then
+  rm "$toggle"
+  command -v hyprctl >/dev/null && hyprctl reload >/dev/null
+  echo "removed hotkeys"
+fi
+
 [[ -L $dest ]] && rm "$dest" && echo "unlinked $dest"
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true

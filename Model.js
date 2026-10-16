@@ -159,6 +159,17 @@ function focusEvent(events, now, opts) {
   return ongoing || next
 }
 
+// What a "join" hotkey should open: the focus event if it has a call,
+// otherwise the current or next meeting that does. Plain blocks (Gym, Lunch)
+// don't stand in the way of the call after them.
+function joinable(events, now, opts) {
+  var focus = focusEvent(events, now, opts)
+  if (focus && focus.url) return focus
+  var withCalls = []
+  for (var i = 0; i < (events || []).length; i++) if (events[i].url) withCalls.push(events[i])
+  return focusEvent(withCalls, now, opts)
+}
+
 // "in 12 min", "Now · 18 min left", "Tomorrow 9:00 AM", "Starting"
 function countdown(ev, now, twelve) {
   if (!ev) return ""

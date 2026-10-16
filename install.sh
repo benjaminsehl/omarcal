@@ -21,6 +21,23 @@ fi
 echo "linked $dest -> $here"
 chmod +x "$here/bin/omarcal"
 
+# Hotkeys (⌘⌥J join, ⌘⌥⇧J new meeting), loaded the way Omarchy loads its
+# own toggles. Rolled back if Hyprland rejects them.
+toggles="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr"
+mkdir -p "$toggles"
+printf -- '-- Written by omarcal install.sh.\ndofile([[%s/hypr/omarcal.lua]])\n' "$here" > "$toggles/omarcal.lua"
+if command -v hyprctl >/dev/null; then
+  hyprctl reload >/dev/null
+  errors="$(hyprctl configerrors 2>/dev/null | sed '/^\s*$/d')"
+  if [[ -n $errors ]]; then
+    rm -f "$toggles/omarcal.lua"; hyprctl reload >/dev/null
+    echo "install: Hyprland rejected hypr/omarcal.lua, hotkeys not installed:" >&2
+    echo "$errors" >&2
+  else
+    echo "installed hotkeys ($toggles/omarcal.lua)"
+  fi
+fi
+
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 sleep 1
 # The manifest declares clonedFrom omarchy.clock, so enabling takes the

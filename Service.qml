@@ -192,11 +192,39 @@ Item {
     return false
   }
 
+  // For hotkeys: there's no panel to show the outcome in, so anything other
+  // than a call opening is said in a notification.
+  function joinNext() {
+    if (demo === "" && phase !== "ready") { toast("Calendar isn't connected", "Open the calendar in the bar to set it up."); return "not connected" }
+    var ev = Model.joinable(events, now, opts)
+    if (!ev) { toast("No meeting to join", "Nothing with a call link coming up."); return "none" }
+    join(ev)
+    return ev.title
+  }
+
+  function newMeetingNow() {
+    if (demo === "" && phase !== "ready" && String(setting("newMeeting", "event")) !== "instant") {
+      toast("Calendar isn't connected", "Opening meet.google.com/new instead.")
+    }
+    newMeeting(true)
+  }
+
+  function toast(title, body, argv) {
+    var cmd = ["notify-send", "-a", "Calendar", "-h", "string:omarchy-glyph:󰃭"]
+    if (argv) cmd.push("-h", "string:omarchy-exec-argv:" + JSON.stringify(argv))
+    cmd.push(String(title), String(body || ""))
+    Quickshell.execDetached(cmd)
+  }
+
+  function opener(url) {
+    return String(setting("openWith", "browser")) === "webapp" ? ["omarchy-launch-webapp", url] : ["xdg-open", url]
+  }
+
   function openCalendar() { open(Model.calendarUrl(account)) }
 
   // "event": a Meet on your calendar starting now (link copied, call opened).
   // "instant": meet.google.com/new, no calendar entry and no API call.
-  function newMeeting() {
+  function newMeeting(fromHotkey) {
     var mode = String(setting("newMeeting", "event"))
     if (mode === "instant" || !ready || demo !== "") {
       open("https://meet.google.com/new" + (account ? "?authuser=" + encodeURIComponent(account) : ""))
@@ -206,10 +234,15 @@ Item {
     creating = true
     run(["new", "--title", String(setting("newMeetingTitle", "Meet")), "--minutes", String(intSetting("newMeetingMinutes", 30, 5, 240))], function(reply) {
       creating = false
-      if (!reply.ok) { fail(reply); return }
+      if (!reply.ok) {
+        fail(reply)
+        if (fromHotkey) toast("Couldn't create a meeting", reply.message || "", reply.url ? opener(reply.url) : null)
+        return
+      }
       var url = Model.joinUrl({ url: reply.url, service: "meet" }, reply.account || account)
       copy(reply.url, "Meet link")
       open(url)
+      if (fromHotkey) toast("Meet link copied", reply.url, opener(url))
       refresh()
     })
   }
@@ -234,8 +267,7 @@ Item {
     var body = Model.rangeLabel(ev, twelveHour)
       + (ev.url ? " · Click to join" + (ev.serviceName ? " " + ev.serviceName : "") : "")
     var argv = ["notify-send", "-a", "Calendar", "-h", "string:omarchy-glyph:󰃭"]
-    if (url) argv.push("-h", "string:omarchy-exec-argv:" + JSON.stringify(
-      String(setting("openWith", "browser")) === "webapp" ? ["omarchy-launch-webapp", url] : ["xdg-open", url]))
+    if (url) argv.push("-h", "string:omarchy-exec-argv:" + JSON.stringify(opener(url)))
     argv.push(ev.title, body)
     Quickshell.execDetached(argv)
   }
