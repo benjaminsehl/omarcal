@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""omarcal — the Google Calendar side of the Omarchy calendar widget.
+
+Standard library only. Every command prints exactly one JSON object on stdout;
+the shell widget never parses anything else.
+
+  omarcal status                 what is configured, who is signed in
+  omarcal auth                   sign in (opens the browser, loopback + PKCE)
+  omarcal events [--days N]      upcoming events across your calendars
+                 [--calendars a,b] [--cached]
+  omarcal new [--title T] [--minutes M]
+                                 put a Google Meet on the calendar, now
+  omarcal logout                 revoke and forget the token
+
+Files (none of them are ever printed):
+  $XDG_CONFIG_HOME/omarcal/client_secret.json   your OAuth "Desktop app" client
+  $XDG_STATE_HOME/omarcal/token.json            refresh token, mode 0600
+  $XDG_CACHE_HOME/omarcal/events.json           last good fetch, for offline
+"""
+
+import base64
+import concurrent.futures
+import datetime as dt
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "omarcal")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "omarcal")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "omarcal")
+CLIENT_FILE = os.environ.get("OMARCAL_CLIENT_SECRET") or os.path.join(CONFIG_DIR, "client_secret.json")
+TOKEN_FILE = os.path.join(STATE_DIR, "token.json")
+CACHE_FILE = os.path.join(CACHE_DIR, "events.json")
+
+AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+REVOKE_URI = "https://oauth2.googleapis.com/revoke"
+API = "https://www.googleapis.com/calendar/v3"
+# Read and write events (write is only used to create a Meet), and list
+# calendars. Nothing else: no settings, no ACLs, no deleting calendars.
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+]
+TIMEOUT = 15
+
+
+class Fail(Exception):
+    def __init__(self, code, message, status=1, url=""):
+        super().__init__(message)
+        self.code, self.message, self.status, self.url = code, message, status, url
+
+
+def out(obj, status=0):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    sys.exit(status)
+
+
+# ── Files ────────────────────────────────────────────────────────────────────
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_private(path, obj):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def client():
+    data = read_json(CLIENT_FILE)
+    if not data:
+        raise Fail("no-client", "No OAuth client. Save your Desktop-app client JSON to " + CLIENT_FILE)
+    c = data.get("installed") or data.get("web") or data
+    if not c.get("client_id"):
+        raise Fail("no-client", CLIENT_FILE + " has no client_id")
+    return c
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+def request(method, url, data=None, headers=None, form=False):
+    body = None
+    hdrs = {"Accept": "application/json", "User-Agent": "omarcal/1"}
+    hdrs.update(headers or {})
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read() or b"{}")
+        except ValueError:
+            payload = {}
+        return e.code, payload
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+        raise Fail("network", "Can't reach Google: " + str(getattr(e, "reason", e)))
+
+
+def api_error(payload, fallback):
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        return err.get("message") or fallback
+    if isinstance(err, str):
+        return payload.get("error_description") or err
+    return fallback
+
+
+def api_disabled(payload):
+    """The activation URL if Google says the Calendar API isn't enabled for
+    this OAuth client's project (the usual first-run mistake), else None."""
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return None
+    reasons = [e.get("reason") for e in err.get("errors") or [] if isinstance(e, dict)]
+    url = ""
+    for d in err.get("details") or []:
+        if not isinstance(d, dict):
+            continue
+        reasons.append(d.get("reason"))
+        url = url or ((d.get("metadata") or {}).get("activationUrl") or "")
+    if "accessNotConfigured" not in reasons and "SERVICE_DISABLED" not in reasons:
+        return None
+    if not url:
+        m = re.search(r"https://console\.developers\.google\.com/\S+", err.get("message", ""))
+        url = m.group(0).rstrip(".") if m else "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
+    return url
+
+
+# ── Tokens ───────────────────────────────────────────────────────────────────
+
+def load_token():
+    tok = read_json(TOKEN_FILE)
+    if not tok or not tok.get("refresh_token"):
+        raise Fail("no-token", "Not signed in")
+    return tok
+
+
+def refresh(tok):
+    c = client()
+    status, payload = request("POST", TOKEN_URI, {
+        "client_id": c["client_id"],
+        "client_secret": c.get("client_secret", ""),
+        "refresh_token": tok["refresh_token"],
+        "grant_type": "refresh_token",
+    }, form=True)
+    if status != 200:
+        if payload.get("error") in ("invalid_grant", "unauthorized_client", "invalid_client"):
+            # Revoked, expired (a "Testing" consent screen expires tokens after
+            # 7 days) or the client was deleted. The token is no use any more.
+            try:
+                os.remove(TOKEN_FILE)
+            except OSError:
+                pass
+            raise Fail("no-token", "Google signed you out (" + payload.get("error") + "). Sign in again.")
+        raise Fail("auth", api_error(payload, "Token refresh failed (%d)" % status))
+    tok["access_token"] = payload["access_token"]
+    tok["expires_at"] = time.time() + int(payload.get("expires_in", 3600)) - 60
+    write_private(TOKEN_FILE, tok)
+    return tok
+
+
+def access_token(force=False):
+    tok = load_token()
+    if force or not tok.get("access_token") or time.time() >= tok.get("expires_at", 0):
+        tok = refresh(tok)
+    return tok["access_token"]
+
+
+def api(method, path, params=None, data=None):
+    url = API + path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+    for attempt in (0, 1):
+        status, payload = request(method, url, data, {"Authorization": "Bearer " + access_token(force=attempt == 1)})
+        if status == 401 and attempt == 0:
+            continue
+        if status >= 400:
+            disabled = api_disabled(payload)
+            if disabled is not None:
+                raise Fail("api-disabled", "The Google Calendar API is off in your Cloud project.", url=disabled)
+            code = "forbidden" if status == 403 else "api"
+            raise Fail(code, api_error(payload, "Google Calendar returned %d" % status))
+        return payload
+    raise Fail("auth", "Unauthorized")
+
+
+# ── Auth (installed-app loopback flow with PKCE) ─────────────────────────────
+
+PAGE = """<!doctype html><meta charset=utf-8><title>omarcal</title>
+<style>html{background:#1d1c1a;color:#dedad2;font:15px/1.5 ui-monospace,monospace}
+body{display:grid;place-items:center;height:100vh;margin:0}p{margin:0}
+i{display:inline-block;width:.6em;height:.6em;margin-right:.8em;background:%s}</style>
+<p><i></i>%s</p>"""
+
+
+def cmd_auth(_args):
+    c = client()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(24)
+    result = {}
+    done = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" not in q and "error" not in q:
+                self.send_response(404)
+                self.end_headers()
+                return
+            ok = q.get("state", [""])[0] == state and "code" in q
+            if ok:
+                result["code"] = q["code"][0]
+            else:
+                result["error"] = q.get("error", ["state mismatch"])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            msg = "Connected. You can close this tab." if ok else "Not connected: " + html.escape(result["error"])
+            self.wfile.write((PAGE % ("#8daa6e" if ok else "#e2553a", msg)).encode())
+            done.set()
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    redirect = "http://127.0.0.1:%d/" % server.server_port
+    url = AUTH_URI + "?" + urllib.parse.urlencode({
+        "client_id": c["client_id"],
+        "redirect_uri": redirect,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    opener = os.environ.get("OMARCAL_OPEN") or "xdg-open"
+    try:
+        subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        sys.stderr.write("Open this URL to sign in:\n" + url + "\n")
+    if not done.wait(300):
+        server.shutdown()
+        raise Fail("auth", "Sign-in timed out")
+    server.shutdown()
+    if "code" not in result:
+        raise Fail("auth", "Sign-in cancelled (" + result.get("error", "unknown") + ")")
+
+    status, payload = request("POST", TOKEN_URI, {
+        "client_id": c["client_id"],
+        "client_secret": c.get("client_secret", ""),
+        "code": result["code"],
+        "code_verifier": verifier,
+        "redirect_uri": redirect,
+        "grant_type": "authorization_code",
+    }, form=True)
+    if status != 200 or not payload.get("refresh_token"):
+        raise Fail("auth", api_error(payload, "Google did not return a refresh token"))
+    granted = set(str(payload.get("scope", "")).split())
+    missing = [s for s in SCOPES if s not in granted]
+    write_private(TOKEN_FILE, {
+        "refresh_token": payload["refresh_token"],
+        "access_token": payload["access_token"],
+        "expires_at": time.time() + int(payload.get("expires_in", 3600)) - 60,
+        "scope": payload.get("scope", ""),
+    })
+    account = primary_account()
+    tok = load_token()
+    tok["account"] = account
+    write_private(TOKEN_FILE, tok)
+    out({"ok": True, "account": account, "missingScopes": missing})
+
+
+def primary_account():
+    try:
+        cal = api("GET", "/users/me/calendarList/primary", {"fields": "id"})
+        return cal.get("id", "")
+    except Fail:
+        return ""
+
+
+def cmd_status(_args):
+    configured = read_json(CLIENT_FILE) is not None
+    tok = read_json(TOKEN_FILE) or {}
+    out({
+        "configured": configured,
+        "authorized": bool(tok.get("refresh_token")),
+        "account": tok.get("account", ""),
+        "clientFile": CLIENT_FILE,
+    })
+
+
+def cmd_logout(_args):
+    tok = read_json(TOKEN_FILE) or {}
+    if tok.get("refresh_token"):
+        try:
+            request("POST", REVOKE_URI, {"token": tok["refresh_token"]}, form=True)
+        except Fail:
+            pass
+    for path in (TOKEN_FILE, CACHE_FILE):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    out({"ok": True})
+
+
+# ── Events ───────────────────────────────────────────────────────────────────
+
+# Most specific first. Each pattern matches a join URL as written in a
+# location, a description (often HTML) or a conference entry point.
+SERVICES = [
+    ("meet", "Google Meet", r"https://meet\.google\.com/(?:lookup/)?[a-z0-9-]+(?:\?[^\s\"'<>]*)?"),
+    ("zoom", "Zoom", r"https://(?:[a-z0-9-]+\.)?zoom(?:gov)?\.us/(?:j|my|w|s)/[^\s\"'<>]+"),
+    ("teams", "Microsoft Teams", r"https://teams\.(?:microsoft|live)\.com/(?:l/meetup-join|meet)/[^\s\"'<>]+"),
+    ("webex", "Webex", r"https://(?:[a-z0-9-]+\.)?webex\.com/[^\s\"'<>]+"),
+    ("tuple", "Tuple", r"https://tuple\.app/c/[^\s\"'<>]+"),
+    ("around", "Around", r"https://(?:meet\.)?around\.co/[^\s\"'<>]+"),
+    ("whereby", "Whereby", r"https://whereby\.com/[^\s\"'<>]+"),
+    ("jitsi", "Jitsi", r"https://meet\.jit\.si/[^\s\"'<>]+"),
+    ("slack", "Slack huddle", r"https://app\.slack\.com/huddle/[^\s\"'<>]+"),
+    ("chime", "Amazon Chime", r"https://(?:app\.)?chime\.aws/[^\s\"'<>]+"),
+    ("gotomeeting", "GoTo Meeting", r"https://(?:global\.)?gotomeet(?:ing)?\.(?:me|com)/[^\s\"'<>]+"),
+    ("discord", "Discord", r"https://discord(?:app)?\.(?:gg|com)/[^\s\"'<>]+"),
+    ("facetime", "FaceTime", r"https://facetime\.apple\.com/join[^\s\"'<>]+"),
+]
+_COMPILED = [(k, n, re.compile(p, re.I)) for k, n, p in SERVICES]
+
+
+def find_link(*texts):
+    for text in texts:
+        if not text:
+            continue
+        clean = html.unescape(str(text))
+        for key, name, rx in _COMPILED:
+            m = rx.search(clean)
+            if m:
+                return m.group(0).rstrip(".,;:)]}>"), key, name
+    return "", "", ""
+
+
+def conference(ev):
+    """(url, service key, service name) for the event's call, if it has one."""
+    conf = ev.get("conferenceData") or {}
+    for ep in conf.get("entryPoints") or []:
+        if ep.get("entryPointType") == "video" and ep.get("uri"):
+            url, key, name = find_link(ep["uri"])
+            sol = ((conf.get("conferenceSolution") or {}).get("name")) or name or "Video call"
+            return ep["uri"], key or "video", sol
+    if ev.get("hangoutLink"):
+        return ev["hangoutLink"], "meet", "Google Meet"
+    return find_link(ev.get("location"), ev.get("description"))
+
+
+def to_ms(when):
+    """Epoch ms for a Google start/end. All-day dates are local midnights."""
+    if not when:
+        return 0
+    if when.get("dateTime"):
+        return int(dt.datetime.fromisoformat(when["dateTime"].replace("Z", "+00:00")).timestamp() * 1000)
+    d = dt.date.fromisoformat(when["date"])
+    return int(dt.datetime(d.year, d.month, d.day).astimezone().timestamp() * 1000)
+
+
+def normalize(ev, cal):
+    me = next((a for a in ev.get("attendees") or [] if a.get("self")), None)
+    others = [a for a in ev.get("attendees") or [] if not a.get("self") and not a.get("resource")]
+    url, service, service_name = conference(ev)
+    location = ev.get("location") or ""
+    if location and url and url in location:
+        location = ""
+    return {
+        "id": ev.get("id", ""),
+        "uid": ev.get("iCalUID") or ev.get("id", ""),
+        "calendarId": cal["id"],
+        "calendar": cal.get("summaryOverride") or cal.get("summary") or cal["id"],
+        "color": cal.get("backgroundColor") or "",
+        "primary": bool(cal.get("primary")),
+        "title": ev.get("summary") or "(No title)",
+        "start": to_ms(ev.get("start")),
+        "end": to_ms(ev.get("end")),
+        "allDay": bool((ev.get("start") or {}).get("date")),
+        "location": location[:200],
+        "url": url,
+        "service": service,
+        "serviceName": service_name,
+        "htmlLink": ev.get("htmlLink", ""),
+        "response": (me or {}).get("responseStatus", "accepted"),
+        "guests": len(others),
+        "organizer": ((ev.get("organizer") or {}).get("displayName") or (ev.get("organizer") or {}).get("email") or ""),
+        "organizerSelf": bool((ev.get("organizer") or {}).get("self")),
+        "type": ev.get("eventType", "default"),
+        "status": ev.get("status", "confirmed"),
+    }
+
+
+EVENT_FIELDS = ("items(id,iCalUID,status,summary,location,description,htmlLink,hangoutLink,"
+                "start,end,eventType,attendees(self,resource,responseStatus),organizer,"
+                "conferenceData(entryPoints(entryPointType,uri),conferenceSolution(name))),nextPageToken")
+
+
+def fetch_calendar(cal, time_min, time_max):
+    items, token = [], None
+    while True:
+        params = {
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": 250,
+            "fields": EVENT_FIELDS,
+        }
+        if token:
+            params["pageToken"] = token
+        page = api("GET", "/calendars/" + urllib.parse.quote(cal["id"], safe="") + "/events", params)
+        items.extend(page.get("items") or [])
+        token = page.get("nextPageToken")
+        if not token or len(items) > 1000:
+            return [normalize(ev, cal) for ev in items]
+
+
+def keep(ev):
+    # Working-location chips and cancelled instances aren't things you attend.
+    return ev["status"] != "cancelled" and ev["type"] not in ("workingLocation",)
+
+
+def cmd_events(args):
+    days = max(1, min(14, int(args.get("days", 3))))
+    wanted = [c for c in str(args.get("calendars", "")).split(",") if c.strip()]
+    if args.get("cached"):
+        cached = read_json(CACHE_FILE)
+        if cached:
+            cached["stale"] = True
+            out(cached)
+        raise Fail("no-cache", "Nothing cached yet")
+
+    client()  # "no-client" (set up) before "no-token" (sign in)
+    try:
+        listing = api("GET", "/users/me/calendarList", {
+            "minAccessRole": "reader",
+            "fields": "items(id,summary,summaryOverride,backgroundColor,primary,selected,hidden)",
+        })
+        cals = listing.get("items") or []
+        if wanted:
+            cals = [c for c in cals if c["id"] in wanted or (c.get("primary") and "primary" in wanted)]
+        else:
+            cals = [c for c in cals if c.get("selected") and not c.get("hidden")]
+
+        local = dt.datetime.now().astimezone()
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        time_min = start.isoformat()
+        time_max = (start + dt.timedelta(days=days)).isoformat()
+
+        events, errors = [], []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(fetch_calendar, c, time_min, time_max): c for c in cals}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    events.extend(fut.result())
+                except Fail as e:
+                    if e.code in ("no-token", "network"):
+                        raise
+                    errors.append(futures[fut].get("summary", "") + ": " + e.message)
+
+        # The same meeting shows up once per calendar it's on; keep one,
+        # preferring your own calendar's copy (it carries your response).
+        events.sort(key=lambda e: (not e["primary"]))
+        seen, unique = set(), []
+        for ev in events:
+            key = (ev["uid"], ev["start"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if keep(ev):
+                unique.append(ev)
+        unique.sort(key=lambda e: (e["start"], not e["allDay"], e["end"], e["title"].lower()))
+
+        tok = read_json(TOKEN_FILE) or {}
+        if not tok.get("account"):
+            primary = next((c["id"] for c in listing.get("items") or [] if c.get("primary")), "")
+            if primary and tok.get("refresh_token"):
+                tok["account"] = primary
+                write_private(TOKEN_FILE, tok)
+        result = {
+            "ok": True,
+            "account": tok.get("account", ""),
+            "fetchedAt": int(time.time() * 1000),
+            "calendars": [{"id": c["id"], "name": c.get("summaryOverride") or c.get("summary", ""),
+                           "color": c.get("backgroundColor", "")} for c in cals],
+            "events": unique,
+            "errors": errors,
+            "stale": False,
+        }
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        write_private(CACHE_FILE, result)
+        out(result)
+    except Fail as e:
+        if e.code == "network":
+            cached = read_json(CACHE_FILE)
+            if cached:
+                cached.update({"stale": True, "warning": e.message})
+                out(cached)
+        raise
+
+
+def cmd_new(args):
+    minutes = max(5, min(240, int(args.get("minutes", 30))))
+    title = str(args.get("title") or "Meet")
+    now = dt.datetime.now().astimezone().replace(second=0, microsecond=0)
+    body = {
+        "summary": title,
+        "start": {"dateTime": now.isoformat()},
+        "end": {"dateTime": (now + dt.timedelta(minutes=minutes)).isoformat()},
+        "conferenceData": {"createRequest": {
+            "requestId": uuid.uuid4().hex,
+            "conferenceSolutionKey": {"type": "hangoutsMeet"},
+        }},
+    }
+    ev = api("POST", "/calendars/primary/events", {"conferenceDataVersion": 1}, body)
+    # Google usually returns the link straight away; when the conference is
+    # still "pending" it appears within a second or two.
+    for _ in range(8):
+        url = ev.get("hangoutLink") or conference(ev)[0]
+        if url:
+            tok = read_json(TOKEN_FILE) or {}
+            out({"ok": True, "url": url, "id": ev.get("id", ""), "htmlLink": ev.get("htmlLink", ""),
+                 "account": tok.get("account", "")})
+        time.sleep(0.5)
+        ev = api("GET", "/calendars/primary/events/" + urllib.parse.quote(ev["id"], safe=""),
+                 {"fields": "id,htmlLink,hangoutLink,conferenceData"})
+    raise Fail("api", "The event was created but Google didn't attach a Meet link")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def parse_args(argv):
+    args, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            key = a[2:]
+            if "=" in key:
+                key, val = key.split("=", 1)
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                val = argv[i + 1]
+                i += 1
+            else:
+                val = True
+            args[key] = val
+        i += 1
+    return args
+
+
+COMMANDS = {"status": cmd_status, "auth": cmd_auth, "events": cmd_events, "new": cmd_new, "logout": cmd_logout}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    try:
+        COMMANDS[sys.argv[1]](parse_args(sys.argv[2:]))
+    except Fail as e:
+        reply = {"ok": False, "error": e.code, "message": e.message}
+        if e.url:
+            reply["url"] = e.url
+        out(reply, e.status)
+    except Exception as e:  # never leave the widget with nothing to parse
+        out({"ok": False, "error": "internal", "message": "%s: %s" % (type(e).__name__, e)}, 1)
+
+
+if __name__ == "__main__":
+    main()
